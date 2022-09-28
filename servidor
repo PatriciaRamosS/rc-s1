@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+
+import asyncio
+from camadafisica import PTY
+from tcp import Servidor
+from ip import IP
+from slip import CamadaEnlace
+import re
+
+
+def validar_nome(nome):
+    #return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None # Mudei, mas caso dê erro retornar para esse
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+
+def sair(conexao):
+    print(conexao, 'conexão fechada')    
+    
+    if conexao in residuais:
+        del residuais[conexao]
+    
+    # Se o usuário que saiu está conectado manda mensagem para
+    # todos os usuários conectados a ele e remove o usuário
+    # de todos os canais 
+    if conexao in nicks:
+        usuario = nicks[conexao]
+        resposta = b':%s QUIT :Conection closed\r\n' % usuario
+        # Filtra os canais com o usuário
+        listaCanais = filter(lambda canal: usuario in canais[canal], list(canais.keys()))
+        # Para cada canal na lista de canais
+        for canal in listaCanais:
+            # E para todos os nicks no canal
+            for nick in canais[canal]:
+                # Se o nick não é o usuário envia a mensagem para o nick
+                if not nick == usuario:
+                    membroConectado = canalDestinatario(nick)[0]
+                    membroConectado.enviar(resposta)
+            # Removendo usuário do canal
+            canais[canal].remove(usuario)
+            canais[canal].sort()
+        
+        # Removendo conexão do usuário
+        del nicks[conexao]
+    
+    conexao.fechar()
+
+def dados_recebidos(conexao, dados):
+    if dados == b'':
+      return sair(conexao)
+
+    mensagens = TratarMSG(conexao, dados)
+    for m in mensagens:
+      if not len(m): continue
+
+      tipo, cod = m.split(b' ', 1)
+      print('> Processing message. Type: "%s" Data: "%s"' % (tipo, cod))
+      if tipo == b'PING':
+        conexao.enviar(b':server PONG server :%s\r\n' % cod)
+      elif tipo == b'NICK':
+        Apelidos(conexao, tipo, cod)
+        
+      elif tipo == b'PRIVMSG':
+        mensagemPrivada(conexao, tipo, cod)
+      elif tipo == b'JOIN':
+        entrarEmCanal(conexao, tipo, cod)
+      elif tipo == b'PART':
+        sairDeCanal(conexao, tipo, cod)
+      else:
+        print('? Message type not implemented: "%s"' % tipo)
+
+    #print('CONEXAO: ', conexao,'\n', 'DADOS: ', dados)
+    print('CONEXAO: ', conexao)
+    
+
+
+def conexao_aceita(conexao):
+    print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+
+
+residuais = {}
+
+def TratarMSG(conexao, dados):
+
+    global residuais
+    mensagens = dados.split(b'\r\n')
+
+    if conexao in residuais:
+
+      mensagens[0] = residuais[conexao] + mensagens[0]
+  
+      if mensagens[-1].endswith(b'\r\n'):
+        mensagens.insert(0,mensagens[-1])
+        residuais.pop(conexao)
+      
+    if not mensagens[-1] == b'':
+      residuais[conexao] = mensagens[-1]
+      mensagens[-1] = b''
+    
+    return mensagens
+
+# Lista de nicks dos usuários
+nicks = {}
+# Lista de canais usados
+canais = {}
+
+
+def usandoNick(cod):
+    return cod.lower() in [nick.lower() for nick in list(nicks.values())]
+
+#Cod é usado para a mensagem recebida, o nickname
+def Apelidos(conexao, tipo, cod):
+
+  global nicks
+  
+  # Valida o nickname
+  if not validar_nome(cod):
+    resposta = b':server 432 * %s :Erroneous nickname\r\n' % cod
+    conexao.enviar(resposta)
+    return
+    
+  nickUsado = nicks[conexao] if conexao in nicks else b'*'
+  # Verifica se o nickname escolhido já está sendo usado
+  if usandoNick(cod):
+    resposta = b':server 433 %s %s :Nickname is already in use\r\n' % (nickUsado, cod)
+    conexao.enviar(resposta)
+    return
+     # Verifica se o usuario ja existe e troca o nick na lista
+  if conexao in nicks: 
+    resposta3 = b':%s NICK %s\r\n' % (nickUsado, cod)	
+    conexao.enviar(resposta3)	
+  # Senão salva o nickname na lista de nicknames
+  else: 
+    #print('conexao\n')   
+    resposta1 = b':server 001 %s :Welcome\r\n' % cod
+    conexao.enviar(resposta1)
+    resposta2 = b':server 422 %s :MOTD File is missing\r\n' % cod
+    conexao.enviar(resposta2)
+    
+  # Armazena novos nicknames ou atualiza de conexões já existentes  
+  nicks[conexao] = cod
+  return
+  
+# Pega a conexão do usuário destinatário, usado para enviar
+# mensagem para um usuário específico
+def canalDestinatario(destinatario):
+    # Verifica se o nick está sendo usado
+    if not usandoNick(destinatario):
+        return []
+    # Procura conexão do destinatário
+    destMinusc = destinatario.lower()
+    conexoes = list(nicks.keys())
+    usuariosMinusc = [usuario.lower() for usuario in list(nicks.values())]
+    conexaoDestinatario = conexoes[usuariosMinusc.index(destMinusc)]    
+    return [conexaoDestinatario]
+     
+#Pega a conexao dos destinatarios do canal, usado para enviar
+#mensagem para um canal, destinatário é o canal
+def canalDestinatarios(remetente, destinatario):
+    conexaoDestinatarios = []
+    #Lista de canais em minúsculo
+    listaCanaisMinusculo = [x.lower() for x in list(canais.keys())]
+    #Índice do canal destinatário na lista de canais em minúsculo
+    canalIndex = listaCanaisMinusculo.index(destinatario.lower())
+    #Salva o nome do canal
+    canal = list(canais.keys())[canalIndex]
+    #if canal in canais:
+    for nick in canais[canal]:
+        if not nick == remetente:
+            # Procura conexão do usuário destinatário
+            conexaoNick = canalDestinatario(nick)
+            conexaoDestinatarios.append(conexaoNick[0])
+
+    return conexaoDestinatarios
+    
+# Envia a mensagem para um usuário ou canal usando PRIVMSG
+def mensagemPrivada(conexao, tipo, cod):
+    destinatario, mensagem = cod.split(b' :', 1)
+    remetente = nicks[conexao]
+    print("Destinatario:", destinatario)
+    #Se é um usuário particular
+    if not destinatario.startswith(b'#'):
+        conexaoDestinatarios = canalDestinatario(destinatario)
+    #Se é um canal
+    else:
+        #Pega as conexões dos membros do canal
+        conexaoDestinatarios = canalDestinatarios(remetente, destinatario)
+    # Manda mensagem para cada membro ou usuário particular
+    for conexaoDestinatario in conexaoDestinatarios:
+        conexaoDestinatario.enviar(b':%s PRIVMSG %s :%s\r\n' % (remetente, destinatario, mensagem))  
+    return
+    
+#Entra em um canal e envia mensagem para todos do canal
+def entrarEmCanal(conexao, tipo, cod):
+    canal = cod
+    # Verificar se é um canal válido
+    if not canal.startswith(b'#') or not validar_nome(canal[1:]):            
+        conexao.enviar(b':server 403 %s :No such channel\r\n' % canal)
+        return
+    usuarioAtual = nicks[conexao]
+    
+    #Se canal não existe cria canal
+    if not canal in canais:
+        canais[canal] = []
+    canais[canal].append(usuarioAtual)
+    canais[canal].sort()
+    
+    for nickCanal in canais[canal]:
+        resposta = b':%s JOIN :%s\r\n' % (usuarioAtual, canal)
+        conexaoUC = canalDestinatario(nickCanal)
+        conexaoUsuarioCanal = conexaoUC[0]
+        conexaoUsuarioCanal.enviar(resposta)
+
+    respostaPadrao = b':server 353 %s = %s :\r\n' % (usuarioAtual, canal)
+    tamanhoMaximo = 512 - len(respostaPadrao)
+    mensagemMembros = [b'']
+    
+    for nickCanal in canais[canal]:
+        proximoValor = (mensagemMembros[-1] + b' ' + nickCanal).strip()
+        if len(proximoValor) < tamanhoMaximo:
+            mensagemMembros[-1] = proximoValor
+        else:
+            mensagemMembros.append(nickCanal)
+
+    for mensagemMembro in mensagemMembros:
+        resposta = b':server 353 %s = %s :%s\r\n' % (usuarioAtual, canal, mensagemMembro)
+        conexao.enviar(resposta)
+
+    ultimaResposta = b':server 366 %s %s :End of /NAMES list.\r\n' % (usuarioAtual, canal)
+    conexao.enviar(ultimaResposta)
+    return
+
+#Remover usuario do canal e enviar mensagem para todos que ele saiu do canal    
+def sairDeCanal(conexao, tipo, cod):
+    usuario = nicks[conexao]
+    canal = cod.split(b' ', 1)[0]
+    # Verificar nome do canal
+    if not canal.startswith(b'#') or not validar_nome(canal[1:]):            
+        conexao.enviar(b':server 403 %s :No such channel\r\n' % canal)
+        return
+    if not canal in canais:
+        return
+    if not usuario in canais[canal]:
+        return
+    
+    #Enviar mensagem para todos
+    resposta = b':%s PART %s\r\n' % (usuario, canal)
+    for nickCanal in canais[canal]:
+        conexaoUsuarioCanal = canalDestinatario(nickCanal)[0]
+        conexaoUsuarioCanal.enviar(resposta)
+     
+    canais[canal].remove(usuario)
+    canais[canal].sort()
+    return
+    
+linha_serial = PTY()
+outra_ponta = '192.168.123.1'
+nossa_ponta = '192.168.123.2'
+
+print('Para conectar a outra ponta da camada física, execute:')
+print('  sudo slattach -v -p slip {}'.format(linha_serial.pty_name))
+print('  sudo ifconfig sl0 {} pointopoint {}'.format(outra_ponta, nossa_ponta))
+print()
+print('O serviço ficará acessível no endereço {}'.format(nossa_ponta))
+print()
+
+enlace = CamadaEnlace({outra_ponta: linha_serial})
+rede = IP(enlace)
+rede.definir_endereco_host(nossa_ponta)
+rede.definir_tabela_encaminhamento([
+    ('0.0.0.0/0', outra_ponta)
+])
+servidor = Servidor(rede, 6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+print('> Servidor started')
+asyncio.get_event_loop().run_forever()
